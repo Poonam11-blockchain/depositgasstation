@@ -1,0 +1,26 @@
+[
+  {
+    "userId": 1754052731848,
+    "evm": {
+      "address": "0x3E1BBC3B2EF250be0CCB19A71e0a720692D5838A",
+      "privateKey": "0xbd4cf48bc6961c5b86893ac719ef21c4264aad75b96ad13e28cd81a0d58fddb7",
+      "path": "m/44'/60'/0'/0/0"
+    },
+    "bsc": {
+      "address": "0x3E1BBC3B2EF250be0CCB19A71e0a720692D5838A",
+      "privateKey": "0xbd4cf48bc6961c5b86893ac719ef21c4264aad75b96ad13e28cd81a0d58fddb7",
+      "path": "m/44'/60'/0'/0/0"
+    },
+    "tron": {
+      "address": "TQPntbLv4QsbKB93bj7WcPAqt5vUM2Hvjj",
+      "privateKey": "0xe8490afcff48c27e5f69083695fb524799cf7ce477b8608d0f18d718e58fe5f7",
+      "path": "m/44'/195'/0'/0/0"
+    },
+    "btc": {
+      "address": "tb1qa8pxt5w842ndxehv75l92gwzlxpdn3h0vewza2",
+      "privateKey": "cTYfCVkoJMa4ftFi2CCHbhfhvASYNaT55BkVgwhqghENDeQaNCD8",
+      "path": "m/84'/1'/0'/0/0"
+    },
+    "createdAt": "2025-08-01T12:52:11.848Z"
+  }
+]

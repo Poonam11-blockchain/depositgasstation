@@ -1,0 +1,14 @@
+[
+  {
+    "symbol": "USDT",
+    "address": "0xdaF66002cc96b8754B96E5A24700AEb2aF68b168",
+    "decimals": 6,
+    "threshold": 100
+  },
+  {
+    "symbol": "USDC",
+    "address": "0x614Ce335F82e63fE0dA1e8aC66ba4D727971FB19",
+    "decimals": 6,
+    "threshold": 100
+  }
+]
