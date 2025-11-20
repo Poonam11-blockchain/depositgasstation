@@ -1,4 +1,5 @@
-//generateWallet.js
+
+//generateMultichainwallets.js
 require("dotenv").config();
 const { ethers } = require("ethers");
 const bip39 = require("bip39");
@@ -13,7 +14,7 @@ const bs58 = _bs58 && _bs58.default ? _bs58.default : _bs58;
 const BTC_NETWORK = bitcoin.networks.testnet;
 
 // === BASE DERIVATION PATHS (index appended later) ===
-const EVM_BASE = `m/44'/60'/0'/0/`;      // ETH / BSC -> append index
+const EVM_BASE = `m/44'/60'/0'/0/`;      // ETH / BSC / POLYGON -> append index
 const TRON_BASE = `m/44'/195'/0'/0/`;    // TRON      -> append index
 const BTC_BASE = `m/84'/1'/0'/0/`;       // BTC TEST  -> append index
 const SOL_TEMPLATE = `m/44'/501'/{i}'/0'`;
@@ -74,13 +75,19 @@ function generateWalletFromMnemonic(mnemonic = null, opts = {}) {
     userId: Date.now().toString(),
     index,
 
-    evm: {
+    ethereum: {
       address: evmAddress,
       privateKey: evmPriv,
       path: evmPath,
     },
 
     bsc: {
+      address: evmAddress,
+      privateKey: evmPriv,
+      path: evmPath,
+    },
+    
+    polygon: {
       address: evmAddress,
       privateKey: evmPriv,
       path: evmPath,

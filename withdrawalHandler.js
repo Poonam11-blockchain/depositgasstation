@@ -1,7 +1,15 @@
+
+//withdrawalHandler.js
 require("dotenv").config();
+const express = require("express");
+const bodyParser = require("body-parser");
 const { ethers } = require("ethers");
 const TronWeb = require("tronweb");
 const mongoose = require("mongoose");
+const bitcoin = require("bitcoinjs-lib");
+const axios = require("axios");
+const { ECPairFactory } = require("ecpair");
+const tinysecp = require("tiny-secp256k1");
 
 const Transaction = require("./src/models/transactionmodels");
 const Withdrawal = require("./src/models/withdrawalmodels");
@@ -9,125 +17,178 @@ const UserBalance = require("./src/models/userBalancemodels");
 
 const ERC20_ABI = require("./erc20.json");
 const TRC20_ABI = require("./trc20.json");
-const [,, chainArg, symbolArg, toAddress, amountRaw] = process.argv;
 
-const chain = chainArg?.toLowerCase();
-const symbol = symbolArg?.toUpperCase();
+const ECPair = ECPairFactory(tinysecp);
 
-if (!chain || !["ethereum", "bsc", "tron", "bitcoin"].includes(chain)) {
-  console.error("❌ Usage: node withdrawalHandler.js <ethereum|bsc|tron|btc> <TOKEN> <to> <amount>");
-  process.exit(1);
-}
+const app = express();
+app.use(bodyParser.json());
 
-if (!symbol || !toAddress || !amountRaw) {
-  console.error("❌ Please provide symbol, recipient, and amount");
-  process.exit(1);
-}
+// Connect once
+mongoose.connect(process.env.MONGO_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+}).then(() => console.log("✅ MongoDB connected"))
+  .catch(err => {
+    console.error("Mongo connection error:", err);
+    process.exit(1);
+  });
 
-(async () => {
+  // --- safe env JSON loader for private key arrays ---
+function loadJsonArrayEnv(name) {
+  const raw = process.env[name];
+  if (!raw) {
+    throw new Error(`Environment variable ${name} is not set`);
+  }
   try {
-    await mongoose.connect(process.env.MONGO_URI, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-    });
-    console.log("✅ MongoDB connected");
-  
-
-    const amount = parseFloat(amountRaw);
-    // const normalizedTo = toAddress.toLowerCase();
-const normalizedTo = chain === "tron" ? toAddress : toAddress.toLowerCase();
- if (chain === "btc" && symbol === "BTC") {
-  const axios = require("axios");
-  const data = await axios.get(`https://blockstream.info/testnet/api/address/${normalizedTo}`);
-  const sats = data.data.chain_stats.funded_txo_sum - data.data.chain_stats.spent_txo_sum;
-  const balance = sats / 1e8;
-  await UserBalance.findOneAndUpdate(
-    { address: normalizedTo, chain, symbol },
-    { $set: { balance } },
-    { upsert: true }
-  );
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+      throw new Error(`${name} must be a non-empty JSON array`);
+    }
+    return parsed;
+  } catch (err) {
+    // avoid printing secrets; include only minimal info
+    throw new Error(`Failed to parse ${name} as JSON array: ${err.message}`);
+  }
 }
-const userBalance = await UserBalance.findOne({ address: normalizedTo, chain, symbol });
 
-    if (!userBalance || userBalance.balance < amount) {
-      console.error("❌ Insufficient balance in database");
-      return;
+// Utility: normalize address by chain
+function normalizeTo(chain, to) {
+  if (!to) return to;
+  return chain === "tron" ? to : to.toLowerCase();
+}
+
+/**
+ * POST /withdrawals
+ * Body: { chain: "ethereum"|"bsc"|"tron"|"bitcoin", symbol: "USDT"|..., to: "addr", amount: 1.23, autoRun: true/false (optional) }
+ */
+
+app.post("/withdrawals", async (req, res) => {
+  try {
+    const { chain: chainArg, symbol: symbolArg, to: toArg, amount: amountRaw, autoRun } = req.body;
+    if (!chainArg || !symbolArg || !toArg || typeof amountRaw === "undefined") {
+      return res.status(400).json({ error: "chain, symbol, to, amount required" });
     }
 
-    const isAutoApproved = amount < 50;
+    const chain = chainArg.toLowerCase();
+    const symbol = symbolArg.toUpperCase();
+    const to = normalizeTo(chain, toArg);
+    const amount = parseFloat(amountRaw);
+
+    if (isNaN(amount) || amount <= 0) {
+      return res.status(400).json({ error: "invalid amount" });
+    }
+
+    // Lookup balance in DB
+    const userBalance = await UserBalance.findOne({ address: to, chain, symbol });
+    if (!userBalance || userBalance.balance < amount) {
+      return res.status(400).json({ error: "insufficient balance in database" });
+    }
+
+    // Auto-approval rule (keeps same behavior as your script)
+const NATIVE_THRESHOLD = 0.001;
+const TOKEN_THRESHOLD = 50;
+const NATIVE_SYMBOLS = new Set(['ETH','BNB','MATIC','TRX','BTC']);
+
+const isNative = NATIVE_SYMBOLS.has(symbol);
+const isAutoApproved = isNative ? (amount < NATIVE_THRESHOLD) : (amount < TOKEN_THRESHOLD);
 
     const withdrawal = await Withdrawal.create({
       chain,
       symbol,
-      to: normalizedTo,
+      to,
       amount,
-      status: isAutoApproved ? "pending" : "pending",
+      status: "pending",
       isApproved: isAutoApproved,
     });
-
-    console.log(`📝 Withdrawal request logged: ${withdrawal._id}`);
-
-    if (!isAutoApproved) {
-      console.log("🛡️ Awaiting multi-sig approval");
-      return;
+  
+    // If not auto-approved just return the created withdrawal (for multisig review)
+    if (!isAutoApproved || autoRun === false) {
+      return res.status(201).json({ message: "withdrawal created (awaiting approval)", withdrawal });
     }
 
-    if (chain === "tron") {
-  if (symbol === "TRX") {
-    await tronNativeWithdraw(normalizedTo, amount);
-  } else {
-    await tronWithdraw(symbol, normalizedTo, amount);
-  }
+    // Attempt to perform withdrawal immediately (same flows as your script)
+    try {
+      if (chain === "tron") {
+        if (symbol === "TRX") {
+          await tronNativeWithdraw(to, amount);
+        } else {
+          await tronWithdraw(symbol, to, amount);
+        }
+      } else if (chain === "bitcoin" || chain === "btc") {
+        await btcWithdraw(symbol, to, amount);
+      } else {
+        // EVM-like chains: ethereum, bsc, polygon
+        if (chain === "polygon") {
+          // polygon has its own helpers which handle gas-topups/refills
+          if (symbol === "MATIC") {
+            await polygonNativeWithdraw(to, amount);
+          } else {
+            await polygonWithdraw(symbol, to, amount);
+          }
+        } else { 
+          // existing behavior for ethereum/bsc
+          if (symbol === "ETH" || symbol === "BNB") {
+            await evmNativeWithdraw(chain, symbol, to, amount);
+          } else {
+            await evmWithdraw(chain, symbol, to, amount);
+          }
+        }
+      }
 
-} else if (chain === "bitcoin") {
-  // Handle BTC withdrawal
-  await btcWithdraw(symbol, normalizedTo, amount);
+      // mark completed + decrement user balance
+      await Withdrawal.findByIdAndUpdate(withdrawal._id, { status: "completed", isApproved: true });
+      await UserBalance.findOneAndUpdate(
+        { address: to, chain, symbol },
+        { $inc: { balance: -amount } }
+      );
 
-} else {
-  if (symbol === "ETH" || symbol === "BNB") {
-    await evmNativeWithdraw(chain, symbol, normalizedTo, amount);
-  } else {
-    await evmWithdraw(chain, symbol, normalizedTo, amount);
-  }
-}
-
-    await Withdrawal.findByIdAndUpdate(withdrawal._id, { status: "completed" });
-    await UserBalance.findOneAndUpdate(
-      { address: normalizedTo, chain, symbol },
-      { $inc: { balance: -amount } }
-    );
-
-    console.log("✅ Balance updated & withdrawal completed.");
+      return res.status(200).json({ message: "withdrawal completed", withdrawalId: withdrawal._id });
+    } catch (innerErr) {
+      console.error("Withdrawal execution error:", innerErr);
+      // mark failed
+      await Withdrawal.findByIdAndUpdate(withdrawal._id, { status: "failed" });
+      return res.status(500).json({ error: "withdrawal execution failed", details: innerErr.message || innerErr });
+    }
   } catch (err) {
-    console.error("❌ Error:", err.message || err);
-  } finally {
-    await mongoose.disconnect();
+    console.error("API error:", err);
+    return res.status(500).json({ error: "internal server error", details: err.message || err });
   }
-})();
+});
 
+app.get("/withdrawals/:id", async (req, res) => {
+  const w = await Withdrawal.findById(req.params.id);
+  if (!w) return res.status(404).json({ error: "not found" });
+  return res.json(w);
+});
 
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`🚀 Withdrawal API listening on ${PORT}`));
+
+/* ------------------------------
+   Below: withdrawal implementation code (copied/adapted from your script)
+   You can move these into a separate module to avoid duplication.
+   ------------------------------ */
+
+// ========== EVM TOKEN WITHDRAW ==========
 async function evmWithdraw(chain, symbol, to, amountRaw) {
   const tokens = require(`./token${chain}.json`);
   const tokenInfo = tokens.find(t => t.symbol === symbol);
   if (!tokenInfo) {
-    console.error(`❌ ${symbol} not configured in token${chain}.json`);
-    return;
+    throw new Error(`${symbol} not configured in token${chain}.json`);
   }
 
   const provider = new ethers.providers.JsonRpcProvider(
     chain === "ethereum" ? process.env.ETH_NODE_URL : process.env.BSC_NODE_URL
   );
 
-  const adminKeys = JSON.parse(process.env.ADMIN_WALLETS_PRIVATE_KEYS);
+  const adminKeys = loadJsonArrayEnv("ADMIN_WALLET_PRIVATE_KEY");
   const mainAdminWallet = new ethers.Wallet(adminKeys[0], provider);
   const token = new ethers.Contract(tokenInfo.address, ERC20_ABI, mainAdminWallet);
-  const amount = ethers.utils.parseUnits(amountRaw, tokenInfo.decimals);
+  const amount = ethers.utils.parseUnits(amountRaw.toString(), tokenInfo.decimals);
 
-  // Check if Admin1 has enough
+  // Check main admin balance and attempt refill if needed
   let mainBalance = await token.balanceOf(mainAdminWallet.address);
   if (mainBalance.lt(amount)) {
-    console.log("Admin1 has insufficient funds, attempting refill");
-
     for (let i = 1; i < adminKeys.length; i++) {
       const fallbackWallet = new ethers.Wallet(adminKeys[i], provider);
       const fallbackToken = new ethers.Contract(tokenInfo.address, ERC20_ABI, fallbackWallet);
@@ -143,12 +204,10 @@ async function evmWithdraw(chain, symbol, to, amountRaw) {
     }
 
     if (mainBalance.lt(amount)) {
-      console.error("❌ Refill failed. Not enough funds in fallback admins.");
-      return;
+      throw new Error("Refill failed. Not enough funds in fallback admins.");
     }
   }
 
-  // Proceed with withdrawal
   const tx = await token.transfer(to, amount);
   await tx.wait();
 
@@ -165,10 +224,8 @@ async function evmWithdraw(chain, symbol, to, amountRaw) {
   console.log(`✅ EVM withdrawal complete: ${tx.hash}`);
 }
 
-////native currency ETH/BNB
-
-async function 
-evmNativeWithdraw(chain, symbol, to, amount) {
+// ========== EVM NATIVE (ETH/BNB) ========== //
+async function evmNativeWithdraw(chain, symbol, to, amount) {
   const provider = new ethers.providers.JsonRpcProvider(
     chain === "ethereum" ? process.env.ETH_NODE_URL : process.env.BSC_NODE_URL
   );
@@ -214,33 +271,211 @@ evmNativeWithdraw(chain, symbol, to, amount) {
   console.log(`Native withdrawal complete: ${tx.hash}`);
 }
 
-// =============== TRC20 TOKEN WITHDRAWAL WITH REFILL ===============
+// ---------------- POLYGON: ERC20 withdraw ----------------
+async function polygonWithdraw(symbol, to, amountRaw) {
+  // tokens file name follows your pattern: tokenpolygon.json
+  const tokens = require("./tokenpolygon.json");
+  const tokenInfo = tokens.find(t => t.symbol === symbol);
+  if (!tokenInfo) throw new Error(`Token ${symbol} not configured in tokenpolygon.json`);
 
-const adminKeys = JSON.parse(process.env.ADMIN_WALLETS_PRIVATE_KEYS_TRON); // [pk1, pk2, pk3...]
+  // provider
+  const provider = new ethers.providers.JsonRpcProvider(process.env.POLYGON_NODE_URL);
+  if (!process.env.POLYGON_NODE_URL) throw new Error("POLYGON_NODE_URL is required");
 
+  // load admin keys: prefer chain-specific var, fallback to generic
+   const adminKeys = JSON.parse(process.env.ADMIN_WALLETS_PRIVATE_KEYS);
+  const mainAdminKey = adminKeys[0];
+  const mainAdminWallet = new ethers.Wallet(mainAdminKey, provider);
+
+  const token = new ethers.Contract(tokenInfo.address, ERC20_ABI, mainAdminWallet);
+  const amount = ethers.utils.parseUnits(String(amountRaw), tokenInfo.decimals);
+
+  // 1) ensure token balance on main admin (refill from fallback token wallets if needed)
+  let mainTokenBal = await token.balanceOf(mainAdminWallet.address);
+  if (BigInt(mainTokenBal.toString()) < BigInt(amount.toString())) {
+    console.log(`⚠️ Main polygon admin token (${symbol}) low. Attempting refill from fallback admins...`);
+    let refilled = false;
+    for (let i = 1; i < adminKeys.length; i++) {
+      try {
+        const fallbackWallet = new ethers.Wallet(adminKeys[i], provider);
+        const fallbackToken = new ethers.Contract(tokenInfo.address, ERC20_ABI, fallbackWallet);
+        const fallbackTokenBal = await fallbackToken.balanceOf(fallbackWallet.address);
+
+        if (BigInt(fallbackTokenBal.toString()) >= BigInt(amount.toString())) {
+          // check fallback has enough native MATIC to pay gas for the token transfer
+          const estGasLimit = ethers.BigNumber.from(90000);
+          const gasPrice = await provider.getGasPrice();
+          const feeNeeded = estGasLimit.mul(gasPrice);
+          const fallbackNative = await provider.getBalance(fallbackWallet.address);
+
+          if (fallbackNative.lt(feeNeeded)) {
+            console.warn(`⚠️ Fallback admin ${fallbackWallet.address} doesn't have enough MATIC to send token. Skipping this fallback.`);
+            continue;
+          }
+
+          const refillTx = await fallbackToken.transfer(mainAdminWallet.address, amount);
+          console.log(`⛽ Refill token ${symbol} from Admin${i + 1}: ${refillTx.hash}`);
+          await refillTx.wait();
+          refilled = true;
+          break;
+        }
+      } catch (e) {
+        console.warn(`⚠️ Refill attempt from Admin${i + 1} failed: ${e.message}`);
+      }
+    }
+
+    // re-check
+    mainTokenBal = await token.balanceOf(mainAdminWallet.address);
+    if (BigInt(mainTokenBal.toString()) < BigInt(amount.toString())) {
+      throw new Error("Refill failed: no fallback admin had enough token + MATIC for gas.");
+    }
+    if (refilled) await new Promise(r => setTimeout(r, 800));
+  }
+
+  // 2) ensure main admin has enough MATIC to pay gas for the token transfer
+  let gasLimit;
+  try {
+    gasLimit = await token.estimateGas.transfer(to, amount, { from: mainAdminWallet.address });
+  } catch (e) {
+    gasLimit = ethers.BigNumber.from(90000);
+  }
+  const gasPrice = await provider.getGasPrice();
+  const feeNeeded = gasLimit.mul(gasPrice);
+  let mainNativeBal = await provider.getBalance(mainAdminWallet.address);
+
+  if (mainNativeBal.lt(feeNeeded)) {
+    console.log(`⚠️ Main polygon admin MATIC low for gas. Attempting to top-up from fallbacks...`);
+    let nativeRefilled = false;
+    for (let i = 1; i < adminKeys.length; i++) {
+      try {
+        const fallbackWallet = new ethers.Wallet(adminKeys[i], provider);
+        const fallbackBalance = await provider.getBalance(fallbackWallet.address);
+        if (fallbackBalance.gte(feeNeeded)) {
+          const tx = await fallbackWallet.sendTransaction({ to: mainAdminWallet.address, value: feeNeeded });
+          console.log(`⛽ Refilled main admin MATIC from Admin${i + 1}: ${tx.hash}`);
+          await tx.wait();
+          nativeRefilled = true;
+          break;
+        }
+      } catch (e) {
+        console.warn(`⚠️ Native refill attempt from Admin${i + 1} failed: ${e.message}`);
+      }
+    }
+
+    mainNativeBal = await provider.getBalance(mainAdminWallet.address);
+    if (mainNativeBal.lt(feeNeeded)) {
+      throw new Error("Refill failed: no fallback admin had sufficient MATIC for gas.");
+    }
+    if (nativeRefilled) await new Promise(r => setTimeout(r, 800));
+  }
+
+  // 3) Do the token transfer
+  try {
+    const tx = await token.transfer(to, amount, { gasLimit, gasPrice });
+    console.log(`✅ Polygon token withdrawal (${symbol}) tx: ${tx.hash}`);
+    await tx.wait();
+
+    await Transaction.create({
+      chain: "polygon",
+      type: "withdrawal",
+      symbol,
+      from: mainAdminWallet.address,
+      to,
+      amount: parseFloat(amountRaw),
+      txHash: tx.hash,
+    });
+  } catch (err) {
+    console.error(`❌ polygonWithdraw failed: ${err && err.message ? err.message : err}`);
+    throw err;
+  }
+}
+
+// ---------------- POLYGON: native MATIC withdraw ----------------
+async function polygonNativeWithdraw(to, amountRaw) {
+  const provider = new ethers.providers.JsonRpcProvider(process.env.POLYGON_NODE_URL);
+  if (!process.env.POLYGON_NODE_URL) throw new Error("POLYGON_NODE_URL is required");
+
+  // load admin keys (chain-specific or fallback)
+  const adminKeys = JSON.parse(process.env.ADMIN_WALLETS_PRIVATE_KEYS);
+  const mainAdminWallet = new ethers.Wallet(adminKeys[0], provider);
+  const value = ethers.utils.parseEther(String(amountRaw));
+
+  // ensure main admin has enough native MATIC; attempt refill from fallback admins
+  let mainBal = await provider.getBalance(mainAdminWallet.address);
+  if (mainBal.lt(value)) {
+    console.log("⚠️ Main polygon admin MATIC low. Trying fallback refill...");
+    let refilled = false;
+    for (let i = 1; i < adminKeys.length; i++) {
+      try {
+        const fallbackWallet = new ethers.Wallet(adminKeys[i], provider);
+        const fallbackBal = await provider.getBalance(fallbackWallet.address);
+        if (fallbackBal.gte(value)) {
+          const tx = await fallbackWallet.sendTransaction({ to: mainAdminWallet.address, value });
+          console.log(`⛽ Refilled MATIC from Admin${i + 1}: ${tx.hash}`);
+          await tx.wait();
+          refilled = true;
+          break;
+        }
+      } catch (e) {
+        console.warn(`⚠️ MATIC refill attempt from Admin${i + 1} failed: ${e.message}`);
+      }
+    }
+
+    mainBal = await provider.getBalance(mainAdminWallet.address);
+    if (mainBal.lt(value)) {
+      throw new Error("Refill failed: no fallback admin had sufficient MATIC for the withdrawal.");
+    }
+    if (refilled) await new Promise(r => setTimeout(r, 800));
+  }
+
+  // send native MATIC
+  try {
+    const tx = await mainAdminWallet.sendTransaction({ to, value });
+    console.log(`✅ Polygon native withdrawal tx: ${tx.hash}`);
+    await tx.wait();
+
+    await Transaction.create({
+      chain: "polygon",
+      type: "withdrawal",
+      symbol: "MATIC",
+      from: mainAdminWallet.address,
+      to,
+      amount: parseFloat(amountRaw),
+      txHash: tx.hash,
+    });
+  } catch (err) {
+    console.error(`❌ polygonNativeWithdraw failed: ${err && err.message ? err.message : err}`);
+    throw err;
+  }
+}
+
+
+
+// ========== TRON HELPERS ==========
+const tronAdminKeys = JSON.parse(process.env.ADMIN_WALLETS_PRIVATE_KEYS_TRON || "[]");
 function getTronWeb(privateKey) {
   return new TronWeb({
     fullHost: process.env.TRON_NODE_URL,
     privateKey,
   });
 }
+
 async function tronWithdraw(symbol, to, amountRaw) {
   const tokens = require("./tokentron.json");
   const tokenInfo = tokens.find(t => t.symbol === symbol);
-  if (!tokenInfo) return console.error(`Token ${symbol} not found in config`);
+  if (!tokenInfo) throw new Error(`Token ${symbol} not found in tokentron.json`);
 
-  const mainTronWeb = getTronWeb(adminKeys[0]);
+  const mainTronWeb = getTronWeb(tronAdminKeys[0]);
   const contract = await mainTronWeb.contract(TRC20_ABI, tokenInfo.address);
-  const amount = BigInt(parseFloat(amountRaw) * 10 ** tokenInfo.decimals).toString();
+  const amount = BigInt(Math.floor(parseFloat(amountRaw) * (10 ** tokenInfo.decimals))).toString();
 
-  const mainAdmin = mainTronWeb.address.fromPrivateKey(adminKeys[0]);
-  const mainBalance = await contract.methods.balanceOf(mainAdmin).call();
+  const mainAdmin = mainTronWeb.address.fromPrivateKey(tronAdminKeys[0]);
+  let mainBalance = await contract.methods.balanceOf(mainAdmin).call();
 
   if (BigInt(mainBalance) < BigInt(amount)) {
-    console.log(`Main admin TRC20 balance low. Trying refill...`);
-    for (let i = 1; i < adminKeys.length; i++) {
-      const fallbackWeb = getTronWeb(adminKeys[i]);
-      const fallbackAddr = fallbackWeb.address.fromPrivateKey(adminKeys[i]);
+    for (let i = 1; i < tronAdminKeys.length; i++) {
+      const fallbackWeb = getTronWeb(tronAdminKeys[i]);
+      const fallbackAddr = fallbackWeb.address.fromPrivateKey(tronAdminKeys[i]);
       const fallbackContract = await fallbackWeb.contract(TRC20_ABI, tokenInfo.address);
       const fallbackBalance = await fallbackContract.methods.balanceOf(fallbackAddr).call();
 
@@ -250,15 +485,12 @@ async function tronWithdraw(symbol, to, amountRaw) {
         break;
       }
     }
+    mainBalance = await contract.methods.balanceOf(mainAdmin).call();
+    if (BigInt(mainBalance) < BigInt(amount)) {
+      throw new Error("Insufficient funds even after refill.");
+    }
   }
 
-  // Retry balance check
-  const finalBalance = await contract.methods.balanceOf(mainAdmin).call();
-  if (BigInt(finalBalance) < BigInt(amount)) {
-    return console.error("Insufficient funds even after refill.");
-  }
-
-  // Proceed with token transfer
   const tx = await contract.methods.transfer(to, amount).send({ feeLimit: 15_000_000 });
 
   await Transaction.create({
@@ -274,18 +506,16 @@ async function tronWithdraw(symbol, to, amountRaw) {
   console.log(`TRC20 ${symbol} withdrawal complete: ${tx}`);
 }
 
-// =============== NATIVE TRX WITHDRAWAL WITH REFILL ===============
 async function tronNativeWithdraw(to, amountRaw) {
-  const amountSun = Math.floor(parseFloat(amountRaw) * 1e6); // TRX in Sun (1e6)
-  const mainTronWeb = getTronWeb(adminKeys[0]);
-  const mainAdmin = mainTronWeb.address.fromPrivateKey(adminKeys[0]);
+  const amountSun = Math.floor(parseFloat(amountRaw) * 1e6);
+  const mainTronWeb = getTronWeb(tronAdminKeys[0]);
+  const mainAdmin = mainTronWeb.address.fromPrivateKey(tronAdminKeys[0]);
 
   let mainBalance = await mainTronWeb.trx.getBalance(mainAdmin);
   if (mainBalance < amountSun) {
-    console.log(`Main TRX balance low. Trying refill...`);
-    for (let i = 1; i < adminKeys.length; i++) {
-      const fallbackWeb = getTronWeb(adminKeys[i]);
-      const fallbackAddr = fallbackWeb.address.fromPrivateKey(adminKeys[i]);
+    for (let i = 1; i < tronAdminKeys.length; i++) {
+      const fallbackWeb = getTronWeb(tronAdminKeys[i]);
+      const fallbackAddr = fallbackWeb.address.fromPrivateKey(tronAdminKeys[i]);
       const fallbackBalance = await fallbackWeb.trx.getBalance(fallbackAddr);
 
       if (fallbackBalance >= amountSun) {
@@ -296,7 +526,7 @@ async function tronNativeWithdraw(to, amountRaw) {
     }
     mainBalance = await mainTronWeb.trx.getBalance(mainAdmin);
     if (mainBalance < amountSun) {
-      return console.error("TRX Refill failed. Insufficient balance.");
+      throw new Error("TRX Refill failed. Insufficient balance.");
     }
   }
 
@@ -315,18 +545,11 @@ async function tronNativeWithdraw(to, amountRaw) {
   console.log(`TRX withdrawal complete: ${tx.txid}`);
 }
 
-
+// ========== BTC WITHDRAW ==========
 async function btcWithdraw(symbol, to, amountRaw) {
-  const bitcoin = require("bitcoinjs-lib");
-  const axios = require("axios");
-  const { ECPairFactory } = require("ecpair");
-  const tinysecp = require("tiny-secp256k1");
-
-  const ECPair = ECPairFactory(tinysecp);
   const NETWORK = bitcoin.networks.testnet;
   const satsPerByte = 2;
-
-  const adminKeys = JSON.parse(process.env.ADMIN_WALLETS_PRIVATE_KEYS_BTC);
+  const adminKeys = JSON.parse(process.env.ADMIN_WALLETS_PRIVATE_KEYS_BTC || "[]");
   const amount = parseFloat(amountRaw);
   const satsToSend = Math.floor(amount * 1e8);
 
@@ -370,12 +593,10 @@ async function btcWithdraw(symbol, to, amountRaw) {
         },
       });
       totalInput += utxo.value;
-
-      // Don't break here yet - need all inputs to estimate real size accurately
     }
 
     const inputsCount = psbt.inputCount;
-    const estimatedFee = estimateFee(inputsCount, 2, satsPerByte); // 2 outputs: to + change
+    const estimatedFee = estimateFee(inputsCount, 2, satsPerByte);
     const change = totalInput - satsToSend - estimatedFee;
 
     if (change < 0) {
@@ -408,7 +629,6 @@ async function btcWithdraw(symbol, to, amountRaw) {
     return;
   }
 
-  console.error("❌ All admin BTC wallets have insufficient funds.");
+  throw new Error("All admin BTC wallets have insufficient funds.");
 }
-
 

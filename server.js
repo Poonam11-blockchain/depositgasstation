@@ -56,6 +56,8 @@ app.post("/api/wallets", async (req, res) => {
         out = { chain: "ethereum", index: walletObj.index, address: walletObj.evm.address, path: walletObj.evm.path };
       } else if (k === "bsc" || k === "binance") {
         out = { chain: "bsc", index: walletObj.index, address: walletObj.bsc.address, path: walletObj.bsc.path };
+      } else if (k === "polygon" || k === "matic") {
+        out = { chain: "polygon", index: walletObj.index, address: walletObj.polygon.address, path: walletObj.polygon.path };
       } else if (k === "tron") {
         out = { chain: "tron", index: walletObj.index, address: walletObj.tron.address, path: walletObj.tron.path };
       } else if (k === "btc" || k === "bitcoin") {
@@ -77,6 +79,9 @@ app.post("/api/wallets", async (req, res) => {
             case "ethereum":
             case "bsc":
               rawPriv = walletObj.evm && walletObj.evm.privateKey; // "0x..."
+              break;
+            case "polygon":
+              rawPriv = walletObj.polygon && walletObj.polygon.privateKey; // "0x..."
               break;
             case "tron":
               rawPriv = walletObj.tron && walletObj.tron.privateKey; // "0x..."
@@ -147,6 +152,7 @@ app.post("/api/wallets", async (req, res) => {
       evm: { address: saved.evm.address, path: saved.evm.path },
       bsc: { address: saved.bsc.address, path: saved.bsc.path },
       tron: { address: saved.tron.address, path: saved.tron.path },
+      polygon: { address: saved.polygon ? saved.polygon.address : undefined, path: saved.polygon ? saved.polygon.path : undefined },
       btc: { address: saved.btc.address, path: saved.btc.path },
       solana: { address: saved.solana.address, path: saved.solana.path, index: saved.solana.index },
       createdAt: saved.createdAt,
@@ -171,6 +177,7 @@ app.get("/api/wallets/:id", async (req, res) => {
       userId: doc.userId,
       evm: { address: doc.evm.address, path: doc.evm.path },
       bsc: { address: doc.bsc.address, path: doc.bsc.path },
+      polygon: { address: doc.polygon ? doc.polygon.address : undefined, path: doc.polygon ? doc.polygon.path : undefined },
       tron: { address: doc.tron.address, path: doc.tron.path },
       btc: { address: doc.btc.address, path: doc.btc.path },
       solana: { address: doc.solana.address, path: doc.solana.path, index: doc.solana.index },

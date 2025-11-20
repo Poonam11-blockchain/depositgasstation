@@ -16,11 +16,13 @@ mongoose.connect(process.env.MONGO_URI || "mongodb://localhost:27017/", {
     useNewUrlParser: true,
     useUnifiedTopology: true,
 });
+
 // in-memory dedupe (put this near the top, after your requires)
 const recentTxs = new Set();   // dedupe for EVM native/token tx hashes
 const RECENT_TX_TTL_MS = Number(process.env.RECENT_TX_TTL_MS || 5 * 60 * 1000); 
 // === Load Wallets ===
 const ethWallets = JSON.parse(fs.readFileSync("./eth_wallets.json"));
+const polygonWallets = JSON.parse(fs.readFileSync("./eth_wallets.json"));
 const bscWallets = JSON.parse(fs.readFileSync("./bsc_wallets.json"));
 const tronWallets = JSON.parse(fs.readFileSync("./tron_wallets.json"));
 // Load BTC Wallets (Testnet)
@@ -28,6 +30,7 @@ const btcWallets = JSON.parse(fs.readFileSync("./derived_wallets_btc2.json"));
 
 const ethAddresses = ethWallets.map((w) => w.address.toLowerCase());
 const bscAddresses = bscWallets.map((w) => w.address.toLowerCase());
+const polygonAddresses = polygonWallets.map((w) => w.address.toLowerCase());
 const tronAddresses = tronWallets.map((w) => w.address);
 const btcAddresses = btcWallets.map((w) => w.address);
 
@@ -37,7 +40,7 @@ const trc20Abi = JSON.parse(fs.readFileSync("./trc20.json"));
 const tokensEth = JSON.parse(fs.readFileSync("./tokenethereum.json"));
 const tokensBsc = JSON.parse(fs.readFileSync("./tokenbsc.json"));
 const tokensTron = JSON.parse(fs.readFileSync("./tokentron.json"));
-
+const tokensPolygon = JSON.parse(fs.readFileSync("./tokenpolygon.json"));
 // === Setup Providers ===
 const ethProvider = new ethers.providers.JsonRpcProvider(process.env.ETH_NODE_URL);
 const bscWeb3 = new Web3(process.env.BSC_NODE_WSS);
@@ -94,51 +97,6 @@ async function monitorETHNative() {
 }
 
 // === Monitor BNB Native Transfers ===
-// async function monitorBNBNative() {
-//   // Correct: pass only the RPC URL here
-//   const provider = new ethers.providers.JsonRpcProvider(process.env.BSC_NODE_URL);
-
-//   // Optional: wrap requests with axios or use AbortController for custom timeouts
-//   let lastBlock = await provider.getBlockNumber();
-
-//   setInterval(async () => {
-//     try {
-//       const currentBlock = await provider.getBlockNumber();
-
-//       for (let i = lastBlock + 1; i <= currentBlock; i++) {
-//         const block = await provider.getBlockWithTransactions(i);
-
-//         for (const tx of block.transactions) {
-//           if (tx.to && bscAddresses.includes(tx.to.toLowerCase())) {
-//             const amount = parseFloat(ethers.utils.formatEther(tx.value));
-
-//             console.log(`💰 Native BNB received: ${amount} BNB from ${tx.from} to ${tx.to}`);
-
-//             await Transaction.create({
-//               chain: "bsc",
-//               type: "deposit",
-//               symbol: "BNB",
-//               from: tx.from,
-//               to: tx.to,
-//               amount,
-//               txHash: tx.hash,
-//             });
-
-//             await UserBalance.findOneAndUpdate(
-//               { address: tx.to.toLowerCase(), chain: "bsc", symbol: "BNB" },
-//               { $inc: { balance: amount } },
-//               { upsert: true, new: true }
-//             );
-//           }
-//         }
-//       }
-
-//       lastBlock = currentBlock;
-//     } catch (err) {
-//       console.error("❌ Error in monitorBNBNative:", err);
-//     }
-//   }, 15_000);
-// }
 async function monitorBNBNative() {
   const provider = new ethers.providers.JsonRpcProvider(process.env.BSC_NODE_URL);
   let lastBlock = await provider.getBlockNumber();
@@ -230,59 +188,230 @@ async function monitorBNBNative() {
   }, POLL_MS);
 }
 
+// === Monitor Polygon native MATIC transfers (polling) ===
+async function monitorPolygonNative() {
+  if (!polygonAddresses.length) {
+    console.log("⚪ No Polygon addresses configured for native monitor. Skipping Polygon native monitor.");
+    return;
+  }
+
+  const provider = new ethers.providers.JsonRpcProvider(process.env.POLYGON_NODE_URL) // already created above
+  let lastBlock = await provider.getBlockNumber();
+  console.log("🟢 Polygon native monitor starting at block", lastBlock);
+
+  const POLL_MS = Number(process.env.POLYGON_POLL_MS || 15_000);
+
+  setInterval(async () => {
+    try {
+      const currentBlock = await provider.getBlockNumber();
+
+      if (currentBlock <= lastBlock) return;
+
+      for (let i = lastBlock + 1; i <= currentBlock; i++) {
+        let block;
+        try {
+          block = await provider.getBlockWithTransactions(i);
+        } catch (e) {
+          console.warn(`⚠️ Failed to fetch Polygon block ${i}:`, e?.message || e);
+          break; // try again next poll
+        }
+        if (!block || !Array.isArray(block.transactions)) continue;
+
+        for (const tx of block.transactions) {
+          try {
+            if (!tx || !tx.to) continue;
+            const toLower = tx.to.toLowerCase();
+            if (!polygonAddresses.includes(toLower)) continue;
+
+            // in-memory dedupe
+            if (recentTxs.has(tx.hash)) continue;
+
+            // DB idempotency check
+            const exists = await Transaction.findOne({ chain: "polygon", txHash: tx.hash }).lean();
+            if (exists) {
+              recentTxs.add(tx.hash);
+              setTimeout(() => recentTxs.delete(tx.hash), RECENT_TX_TTL_MS);
+              continue;
+            }
+
+            // compute sweep/amount
+            const amount = parseFloat(ethers.utils.formatEther(tx.value));
+            console.log(`💰 Native MATIC received: ${amount} MATIC from ${tx.from} to ${tx.to} (tx ${tx.hash})`);
+
+            await Transaction.create({
+              chain: "polygon",
+              type: "deposit",
+              symbol: "MATIC",
+              from: tx.from,
+              to: tx.to,
+              amount,
+              txHash: tx.hash,
+            });
+
+            await UserBalance.findOneAndUpdate(
+              { address: from.toLowerCase(), chain: "polygon", symbol: "MATIC" },
+              { $inc: { balance: amount } },
+              { upsert: true, new: true }
+            );
+
+            // mark seen in memory
+            recentTxs.add(tx.hash);
+            setTimeout(() => recentTxs.delete(tx.hash), RECENT_TX_TTL_MS);
+          } catch (inner) {
+            console.warn("⚠️ Error processing Polygon native tx:", inner?.message || inner);
+          }
+        } // tx loop
+      } // block loop
+
+      lastBlock = currentBlock;
+    } catch (err) {
+      console.error("❌ Error in monitorPolygonNative:", err?.message || err);
+    }
+  }, POLL_MS);
+}
+
+
+
+
 
 
 // === Monitor TRX Native Transfers ===
 async function monitorTRXNative() {
-  let lastBlock = await tronWeb.trx.getCurrentBlock();
-  let lastBlockNum = lastBlock.block_header.raw_data.number;
+  // Initialize lastBlockNum from current block to avoid importing history on restart
+  try {
+    const currentBlock = await tronWeb.trx.getCurrentBlock();
+    var lastBlockNum = currentBlock.block_header.raw_data.number;
+  } catch (e) {
+    console.warn("⚠️ Could not read current TRON block on startup:", e.message || e);
+    // fallback: start from 0 so it will try to catch up (only do this if you intentionally want history)
+    lastBlockNum = 0;
+  }
+
+  console.log("🟠 TRX native monitor starting at block", lastBlockNum);
+
+  // small per-address backoff map (in case RPC fails)
+  const addressBackoff = {};
+
+  // idempotent save helper
+  async function saveTrxIfNew({ txId, fromAddr, toAddr, amount }) {
+    if (!txId) return false;
+    if (recentTxs.has(txId)) return false; // in-memory dedupe
+
+    // DB check for existing tx
+    const exists = await Transaction.findOne({ chain: "tron", txHash: txId }).lean();
+    if (exists) {
+      recentTxs.add(txId);
+      setTimeout(() => recentTxs.delete(txId), RECENT_TX_TTL_MS);
+      return false;
+    }
+
+    try {
+      await Transaction.create({
+        chain: "tron",
+        type: "deposit",
+        symbol: "TRX",
+        from: fromAddr,
+        to: toAddr,
+        amount,
+        txHash: txId,
+        timestamp: new Date()
+      });
+
+      await UserBalance.findOneAndUpdate(
+        { address: toAddr, chain: "tron", symbol: "TRX" },
+        { $inc: { balance: amount } },
+        { upsert: true, new: true }
+      );
+
+      recentTxs.add(txId);
+      setTimeout(() => recentTxs.delete(txId), RECENT_TX_TTL_MS);
+      return true;
+    } catch (e) {
+      // ignore duplicate key race (if you add the DB index below, races will throw 11000)
+      if (e && e.code === 11000) {
+        recentTxs.add(txId);
+        setTimeout(() => recentTxs.delete(txId), RECENT_TX_TTL_MS);
+        return false;
+      }
+      throw e;
+    }
+  }
+
+  const POLL_MS = Number(process.env.TRON_POLL_MS || 15_000);
 
   setInterval(async () => {
     try {
-      const currentBlock = await tronWeb.trx.getCurrentBlock();
-      const currentBlockNum = currentBlock.block_header.raw_data.number;
+      const currentBlockObj = await tronWeb.trx.getCurrentBlock();
+      const currentBlockNum = currentBlockObj.block_header.raw_data.number;
 
-      for (let i = lastBlockNum + 1; i <= currentBlockNum; i++) {
-        const block = await tronWeb.trx.getBlock(i);
+      // nothing new
+      if (currentBlockNum <= lastBlockNum) return;
 
-        for (const tx of block.transactions || []) {
-          const txRaw = tx.raw_data.contract[0].parameter.value;
-
-          const toAddr = tronWeb.address.fromHex(txRaw.to_address);
-          const fromAddr = tronWeb.address.fromHex(txRaw.owner_address);
-
-          if (tronAddresses.includes(toAddr)) {
-            const txInfo = await tronWeb.trx.getTransactionInfo(tx.txID);
-            const amount = txRaw.amount / 1e6;
-
-            console.log(`💰 Native TRX received: ${amount} TRX from ${fromAddr} to ${toAddr}`);
-
-            await Transaction.create({
-              chain: "tron",
-              type: "deposit",
-              symbol: "TRX",
-              from: fromAddr,
-              to: toAddr,
-              amount,
-              txHash: tx.txID,
-            });
-
-            await UserBalance.findOneAndUpdate(
-              { address: fromAddr, chain: "tron", symbol: "TRX" },
-              { $inc: { balance: amount } },
-              { upsert: true, new: true }
-            );
+      for (let b = lastBlockNum + 1; b <= currentBlockNum; b++) {
+        // optional small backoff if RPC failing for specific block
+        try {
+          const block = await tronWeb.trx.getBlock(b);
+          if (!block || !Array.isArray(block.transactions)) {
+            // some nodes return undefined for empty blocks; proceed
+            continue;
           }
+
+          for (const tx of block.transactions || []) {
+            try {
+              // defensive checks - some tx shapes vary
+              const txId = tx.txID || tx.txid || (tx.raw_data && tx.raw_data.txID) || null;
+              if (!txId) continue;
+
+              // avoid repeated processing within poll window
+              if (recentTxs.has(txId)) continue;
+
+              // extract from/to/amount safely
+              // older code: const txRaw = tx.raw_data.contract[0].parameter.value;
+              let txRaw = null;
+              try { txRaw = tx.raw_data && tx.raw_data.contract && tx.raw_data.contract[0] && tx.raw_data.contract[0].parameter && tx.raw_data.contract[0].parameter.value; } catch(e){}
+              if (!txRaw) {
+                // if structure different, attempt to get via getTransactionInfo (slower)
+                try {
+                  const info = await tronWeb.trx.getTransactionInfo(txId);
+                  // info may contain contractRet and other fields; amount may be in raw_data as well
+                } catch (e) {
+                  // skip if can't parse
+                }
+              }
+
+              if (!txRaw) continue;
+
+              const toAddr = tronWeb.address.fromHex(txRaw.to_address);
+              const fromAddr = tronWeb.address.fromHex(txRaw.owner_address);
+              const amount = (txRaw.amount || 0) / 1e6;
+
+              if (!tronAddresses.includes(toAddr)) continue;
+
+              // DB idempotent save
+              await saveTrxIfNew({ txId, fromAddr, toAddr, amount });
+
+              // debug log (only when actually new or not seen recently)
+              if (recentTxs.has(txId)) {
+                console.log(`💰 Native TRX received: ${amount} TRX from ${fromAddr} to ${toAddr} (tx ${txId})`);
+              }
+            } catch (inner) {
+              console.warn("⚠️ Error processing TRX tx inside block:", inner?.message || inner);
+            }
+          } // tx loop
+
+          // advance lastBlockNum as we processed this block
+          lastBlockNum = b;
+        } catch (blkErr) {
+          console.warn(`⚠️ Failed to fetch/process TRON block ${b}:`, blkErr?.message || blkErr);
+          // don't advance lastBlockNum so we retry this block on next poll
+          break;
         }
-      }
-
-      lastBlockNum = currentBlockNum;
-    } catch (e) {
-      console.error("❌ Error in monitorTRXNative:", e.message);
+      } // block loop
+    } catch (err) {
+      console.error("❌ Error in monitorTRXNative:", err?.message || err);
     }
-  }, 15_000);
+  }, POLL_MS);
 }
-
 
 // === Start MonitoringToken ===
 async function monitorETH() {
@@ -405,6 +534,76 @@ async function monitorBSC() {
   setInterval(pollOnce, POLL_MS);
 }
 
+// === Monitor Polygon ERC-20 Tokens (real-time, uses contract.on Transfer) ===
+async function monitorPOLY() {
+  if (!tokensPolygon || tokensPolygon.length === 0) {
+    console.log("⚪ No Polygon tokens configured (tokenpolygon.json). Skipping Polygon token monitor.");
+    return;
+  }
+
+  console.log("🔷 Polygon token monitor starting...");
+   const provider = new ethers.providers.JsonRpcProvider(process.env.POLYGON_NODE_URL) // already created above
+
+  for (const token of tokensPolygon) {
+    try {
+      if (!token || !token.address) continue;
+      const contract = new ethers.Contract(token.address, erc20Abi, provider);
+      console.log(`📡 Watching POLYGON token: ${token.symbol || token.address} at ${token.address}`);
+
+      contract.on("Transfer", async (from, to, value, event) => {
+        try {
+          if (!to) return;
+          const toLower = String(to).toLowerCase();
+          if (!polygonAddresses.includes(toLower)) return;
+
+          // dedupe (in-memory); also check DB below for safety
+          if (recentTxs.has(event.transactionHash)) return;
+
+          // DB idempotency check
+          const already = await Transaction.findOne({ chain: "polygon", txHash: event.transactionHash }).lean();
+          if (already) {
+            recentTxs.add(event.transactionHash);
+            setTimeout(() => recentTxs.delete(event.transactionHash), RECENT_TX_TTL_MS);
+            return;
+          }
+
+          const amountStr = ethers.utils.formatUnits(value, token.decimals || 18);
+          const amount = parseFloat(amountStr);
+
+          console.log(`📥 POLYGON: ${token.symbol} ${amountStr} from ${from} to ${to} (tx ${event.transactionHash})`);
+
+          // Save transaction
+          await Transaction.create({
+            type: "deposit",
+            chain: "polygon",
+            symbol: token.symbol || token.address,
+            from,
+            to,
+            amount,
+            txHash: event.transactionHash,
+          });
+
+          // Update user balance; store address normalized to lower-case
+          await UserBalance.findOneAndUpdate(
+            { address: from.toLowerCase(), chain: "polygon", symbol: token.symbol || token.address },
+            { $inc: { balance: amount } },
+            { upsert: true, new: true }
+          );
+
+          // mark in-memory as seen
+          recentTxs.add(event.transactionHash);
+          setTimeout(() => recentTxs.delete(event.transactionHash), RECENT_TX_TTL_MS);
+        } catch (e) {
+          console.error("🔥 Error in Polygon token event handler:", e?.message || e);
+        }
+      });
+    } catch (e) {
+      console.warn("⚠️ Failed to attach Polygon token listener:", token?.address, e?.message || e);
+    }
+  }
+}
+
+
 tronWeb.setEventServer("https://api.shasta.trongrid.io");
 async function monitorTRON() {
     try {
@@ -459,74 +658,146 @@ async function monitorTRON() {
     }
 }
 
-let lastSeenTxs = {};
+// small in-memory dedupe for all chains (put near your other dedupe sets)
+// const recentTxs = new Set(); // already used elsewhere — reuse here
+// const RECENT_TX_TTL_MS = Number(process.env.RECENT_TX_TTL_MS || 5 * 60 * 1000); // 5 minutes
 
 async function monitorBTCNative() {
   console.log("🟡 BTC Monitor started (Testnet)");
-  const BTC_POLL_MS = Number(process.env.BTC_POLL_MS || 30_000); // increase to 30s or more
+  const BTC_POLL_MS = Number(process.env.BTC_POLL_MS || 30_000);
   const axiosInstance = axios.create({ timeout: 20_000 });
 
-  // small cache TTL map for addresses to avoid repeated heavy calls
+  // addressBackoff prevents hammering an address that returns errors / 429s
   const addressBackoff = {};
+  // store last seen tx id per address (persisted across runtime via DB init)
+  const lastSeenTxId = {};
+
+  // initialize lastSeenTxId from DB so we don't reimport history on restart
+  for (const address of btcAddresses) {
+    try {
+      // find latest TX for this address from DB (if any)
+      const latest = await Transaction.findOne({ chain: "bitcoin", to: address }).sort({ timestamp: -1 }).lean();
+      if (latest && latest.txHash) lastSeenTxId[address] = latest.txHash;
+      else lastSeenTxId[address] = null;
+    } catch (e) {
+      console.warn("⚠️ Could not init lastSeen for", address, e.message || e);
+      lastSeenTxId[address] = null;
+    }
+  }
+
+  // helper: idempotent save (checks DB first)
+  async function saveBtcDepositIfNew({ address, txId, amount, from }) {
+    if (!txId) return false;
+    // in-memory dedupe
+    if (recentTxs.has(txId)) return false;
+    // quick DB check
+    const already = await Transaction.findOne({ chain: "bitcoin", txHash: txId }).lean();
+    if (already) {
+      recentTxs.add(txId);
+      setTimeout(() => recentTxs.delete(txId), RECENT_TX_TTL_MS);
+      return false;
+    }
+    // attempt insert
+    try {
+      await Transaction.create({
+        chain: "bitcoin",
+        type: "deposit",
+        symbol: "BTC",
+        from: from || "unknown",
+        to: address,
+        amount,
+        txHash: txId,
+        timestamp: new Date(),
+      });
+
+      await UserBalance.findOneAndUpdate(
+        { address: address, chain: "bitcoin", symbol: "BTC" },
+        { $inc: { balance: amount } },
+        { upsert: true, new: true }
+      );
+
+      recentTxs.add(txId);
+      setTimeout(() => recentTxs.delete(txId), RECENT_TX_TTL_MS);
+      return true;
+    } catch (e) {
+      // duplicate key or other race could throw 11000 — ignore duplicates
+      if (e && e.code === 11000) {
+        // already inserted by another process
+        recentTxs.add(txId);
+        setTimeout(() => recentTxs.delete(txId), RECENT_TX_TTL_MS);
+        return false;
+      }
+      throw e;
+    }
+  }
 
   setInterval(async () => {
     for (const address of btcAddresses) {
       try {
         if (addressBackoff[address] && Date.now() < addressBackoff[address]) {
-          // still backoff for this address
-          continue;
+          continue; // still backing off
         }
 
-        const res = await axiosInstance.get(`https://blockstream.info/testnet/api/address/${address}/txs`);
-        const txs = res.data;
+        // fetch recent txs (most recent first)
+        const url = `https://blockstream.info/testnet/api/address/${address}/txs`;
+        const res = await axiosInstance.get(url);
+        const txs = Array.isArray(res.data) ? res.data : [];
 
-        for (const tx of txs) {
-          const txId = tx.txid;
+        // if nothing returned, skip
+        if (!txs.length) continue;
 
-          if (lastSeenTxs[address]?.includes(txId)) continue;
+        // build list of unseen txids (stop when we hit lastSeenTxId[address])
+        const lastSeen = lastSeenTxId[address];
+        const unseen = [];
+        for (const t of txs) {
+          if (!t || !t.txid) continue;
+          if (lastSeen && t.txid === lastSeen) break;
+          unseen.push(t); // newest->oldest
+        }
 
-          for (const vout of tx.vout || []) {
-            if (vout.scriptpubkey_address === address) {
-              const amount = vout.value / 1e8;
-              const from = tx.vin?.[0]?.prevout?.scriptpubkey_address || "unknown";
+        // process oldest -> newest so order is chronological
+        unseen.reverse();
 
-              console.log(`💰 Native BTC received: ${amount} BTC → ${address}`);
+        for (const t of unseen) {
+          try {
+            const txId = t.txid;
+            // small in-memory dedupe (handle if RPC returns duplicates)
+            if (recentTxs.has(txId)) continue;
 
-              await Transaction.create({
-                chain: "bitcoin",
-                type: "deposit",
-                symbol: "BTC",
-                from,
-                to: address,
-                amount,
-                txHash: txId,
-              });
+            // find any vout that pays our address
+            for (const vout of t.vout || []) {
+              if (vout.scriptpubkey_address === address) {
+                const amount = (vout.value || 0) / 1e8;
+                // from heuristics: try to get from vin[0] prevout or set unknown
+                const from = t.vin?.[0]?.prevout?.scriptpubkey_address || "unknown";
 
-              await UserBalance.findOneAndUpdate(
-                { address: address, chain: "bitcoin", symbol: "BTC" },
-                { $inc: { balance: amount } },
-                { upsert: true, new: true }
-              );
+                // idempotent save
+                await saveBtcDepositIfNew({ address, txId, amount, from });
+                break; // if multiple vouts to same address, we handle once
+              }
             }
-          }
 
-          if (!lastSeenTxs[address]) lastSeenTxs[address] = [];
-          lastSeenTxs[address].push(txId);
-          lastSeenTxs[address] = lastSeenTxs[address].slice(-50);
+            // update lastSeenTxId for this address to newest processed tx (we'll set final below too)
+            // but keep updating as we go so if process crashes we won't re-process the ones we did
+            lastSeenTxId[address] = txId;
+          } catch (inner) {
+            console.warn("⚠️ Error processing BTC tx:", inner?.message || inner);
+          }
         }
+
+        // if we processed at least one tx, ensure lastSeen set to top-most (txs[0])
+        if (txs.length > 0) lastSeenTxId[address] = txs[0].txid;
       } catch (err) {
         console.error(`❌ Error checking BTC for address ${address}:`, err?.response?.status || err.message);
-
-        // handle 429 specifically: backoff this address for some time
         if (err?.response?.status === 429) {
-          // exponential backoff map
-          addressBackoff[address] = Date.now() + (Number(process.env.BTC_BACKOFF_MS) || 60_000); // 1 minute default
+          addressBackoff[address] = Date.now() + (Number(process.env.BTC_BACKOFF_MS) || 60_000);
           console.warn(`⚠️ 429 for ${address} — backing off for 60s`);
         } else {
-          // for other transient errors, you can wait and try later
+          // transient network error — small backoff
+          addressBackoff[address] = Date.now() + 5_000;
         }
       }
-    }
+    } // end for addresses
   }, BTC_POLL_MS);
 }
 
@@ -820,12 +1091,15 @@ async function main() {
     monitorETH();  //Token
     monitorBSC();  //Token
     monitorTRON(); //Token
-    monitorSPL();
-    monitorSOLNative();
+    monitorSPL();   //Token
+    monitorPOLY(); //Token
+  
 
     monitorETHNative();   // ETH
     monitorBNBNative();   // BNB
     monitorTRXNative();   // TRX
     monitorBTCNative();   //BTC
+    monitorSOLNative();   //SOL
+    monitorPolygonNative(); //POL
 }
 main();
