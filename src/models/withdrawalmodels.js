@@ -8,7 +8,7 @@ const withdrawalSchema = new mongoose.Schema({
   amount: String,
   status: { type: String, default: "pending" }, // pending | approved | rejected | completed
   txHash: String,
-  isApproved: { type: Boolean, default: false }, // ✅ add this line
+  isApproved: { type: Boolean, default: false }, // add this line
   createdAt: { type: Date, default: Date.now },
   approvedAt: Date,
   executedAt: Date,

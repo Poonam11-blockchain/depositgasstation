@@ -1,4 +1,4 @@
-// approveWithdrawals-api.js
+// approveWithdrawals-api.js (Liminal-style custody / signer service)
 require("dotenv").config();
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -8,44 +8,45 @@ const mongoose = require("mongoose");
 const bitcoin = require("bitcoinjs-lib");
 const axios = require("axios");
 const { ECPairFactory } = require("ecpair");
-const tinysecp = require("tiny-secp256k1")
+const tinysecp = require("tiny-secp256k1");
 const ECPair = ECPairFactory(tinysecp);
 
-// your models + helpers (ensure these paths exist)
+// models
 const Withdrawal = require("./src/models/withdrawalmodels");
 const Transaction = require("./src/models/transactionmodels");
 const UserBalance = require("./src/models/userBalancemodels");
 
-// ---- config ----
-const ADMIN_KEY = (process.env.ADMIN_KEY || "").trim(); // must be set in .env
+// admin/API config
+const ADMIN_KEY = (process.env.ADMIN_KEY || "").trim(); // secret key for ops
 const PORT = process.env.APP_PORT || 6000;
 
 const app = express();
 app.use(bodyParser.json());
 
-// ---- DB helper ----
+// ---- DB connection helper ----
 async function ensureDb() {
   if (mongoose.connection.readyState === 1) return;
   const MONGO_URI = process.env.MONGO_URI;
   if (!MONGO_URI) throw new Error("MONGO_URI missing in env");
-  // avoid deprecated options
   await mongoose.connect(MONGO_URI);
-  console.log("✅ MongoDB (approve API) connected");
+  console.log("MongoDB (Approve API) connected");
 }
 
 // ---- small mask util for logs ----
-function mask(s){
+function mask(s) {
   if (!s) return "MISSING";
   const t = String(s).trim();
-  return t.length > 10 ? `${t.slice(0,6)}...${t.slice(-4)}` : t;
+  return t.length > 10 ? `${t.slice(0, 6)}...${t.slice(-4)}` : t;
 }
 
-// ---- admin auth middleware (accepts header OR query param) ----
+// ---- admin auth middleware ----
 function adminAuth(req, res, next) {
-  // prefer header, fallback to query param
-  const headerKey = (req.headers["x-admin-key"] || req.headers["x-api-key"] || "").toString().trim();
-  const queryKey = (req.query && (req.query["x-admin-key"] || req.query["x-api-key"]) || "").toString().trim();
-  const provided = headerKey || queryKey;
+  const headerKey = (req.headers["x-admin-key"] || req.headers["x-api-key"] || "")
+    .toString()
+    .trim();
+  const queryKey =
+    (req.query && (req.query["x-admin-key"] || req.query["x-api-key"])) || "";
+  const provided = (headerKey || queryKey).toString().trim();
 
   if (!ADMIN_KEY) {
     console.error("ADMIN_KEY not set in process.env - blocking access");
@@ -55,69 +56,138 @@ function adminAuth(req, res, next) {
   console.log(`adminAuth: incoming=${mask(provided)} server=${mask(ADMIN_KEY)}`);
 
   if (!provided) return res.status(403).json({ error: "forbidden - missing key" });
-  if (provided !== ADMIN_KEY) return res.status(403).json({ error: "forbidden - invalid key" });
+  if (provided !== ADMIN_KEY)
+    return res.status(403).json({ error: "forbidden - invalid key" });
+
   next();
 }
 
-// ---- process single withdrawal (uses your on-chain helpers) ----
+// ---- core processing: one withdrawal → on-chain send ----
 async function processWithdrawal(withdrawal) {
   const { _id, chain, symbol, to, amount } = withdrawal;
-  const normalizedTo = chain === "tron" ? to : (to || "").toLowerCase();
+  const chainLower = (chain || "").toString().toLowerCase();
+  const symUp = (symbol || "").toString().toUpperCase();
 
-  // set approved first
-  await Withdrawal.findByIdAndUpdate(_id, { isApproved: true });
+  // For EVM, we store balances lowercased; Tron etc keep original
+  const normalizedTo = chainLower === "tron" ? to : (to || "").toLowerCase();
+
+  // mark processing + approved
+  await Withdrawal.findByIdAndUpdate(_id, {
+    isApproved: true,
+    status: "processing",
+    updatedAt: new Date(),
+  });
 
   try {
-    // choose helper (these functions must be in scope - see below)
-    const symUp = (symbol || "").toString().toUpperCase();
-    const chainLower = (chain || "").toString().toLowerCase();
-
+    // Choose on-chain helper (same as before)
     if (chainLower === "tron") {
       if (symUp === "TRX") {
         await tronNativeWithdraw(to, amount);
       } else {
-        await tronWithdraw(symbol, to, amount);
+        await tronWithdraw(symUp, to, amount);
       }
     } else if (chainLower === "bitcoin" || chainLower === "btc") {
-      await btcWithdraw(symbol, to, amount);
-    } else {
-      // polygon/ethereum/bsc flows
-      if (chainLower === "polygon") {
-        if (symUp === "MATIC") {
-          await polygonNativeWithdraw(to, amount);
-        } else {
-          await polygonWithdraw(symbol, to, amount);
-        }
+      await btcWithdraw(symUp, to, amount);
+    } else if (chainLower === "solana") {
+      if (symUp === "SOL") {
+        await solanaNativeWithdraw(to, amount);
       } else {
-        if (symUp === "ETH" || symUp === "BNB") {
-          await evmNativeWithdraw(chainLower, symbol, to, amount);
-        } else {
-          await evmWithdraw(chainLower, symbol, to, amount);
-        }
+        await solanaSplWithdraw(symUp, to, amount);
+      }
+    } else if (chainLower === "polygon") {
+      if (symUp === "MATIC") {
+        await polygonNativeWithdraw(to, amount);
+      } else {
+        await polygonWithdraw(symUp, to, amount);
+      }
+    } else {
+      // ethereum / bsc (EVM)
+      if (symUp === "ETH" || symUp === "BNB") {
+        await evmNativeWithdraw(chainLower, symUp, to, amount);
+      } else {
+        await evmWithdraw(chainLower, symUp, to, amount);
       }
     }
 
-    // success -> mark completed + adjust user balance
-    await Withdrawal.findByIdAndUpdate(_id, { status: "completed" });
+    // success → mark completed + decrement user balance
+    await Withdrawal.findByIdAndUpdate(_id, {
+      status: "completed",
+      updatedAt: new Date(),
+    });
     await UserBalance.findOneAndUpdate(
-      { address: normalizedTo, chain, symbol },
+      { address: normalizedTo, chain: chainLower, symbol: symUp },
       { $inc: { balance: -parseFloat(amount) } }
     );
 
     return { id: _id.toString(), ok: true };
   } catch (err) {
-    console.error(`processWithdrawal(${_id}) failed:`, err && (err.stack || err.message || err));
-    await Withdrawal.findByIdAndUpdate(_id, { status: "failed" });
-    return { id: _id.toString(), ok: false, error: err && err.message ? err.message : String(err) };
+    console.error(
+      `processWithdrawal(${_id}) failed:`,
+      err && (err.stack || err.message || err)
+    );
+    await Withdrawal.findByIdAndUpdate(_id, {
+      status: "failed",
+      updatedAt: new Date(),
+    });
+    return {
+      id: _id.toString(),
+      ok: false,
+      error: err && err.message ? err.message : String(err),
+    };
   }
 }
 
-// ---- approvePendingLarge implementation (no auto-run) ----
-// unified: tokens >= 50; native coins >= 0.001
+// ========== AUTO-APPROVED (policy) PROCESSOR ==========
+// This is your "Liminal engine" that runs auto_approved withdrawals
+let _approveAutoInProgress = false;
+async function approveAutoApproved(limit = 100) {
+  if (_approveAutoInProgress) {
+    console.log("approveAutoApproved: run in progress, skipping.");
+    return { processed: 0, details: [], note: "concurrent_run" };
+  }
+  _approveAutoInProgress = true;
+
+  try {
+    await ensureDb();
+
+    const pending = await Withdrawal.find({
+      isApproved: true,                       // policy auto-approved
+      status: "auto_approved",               // not yet processed by custody engine
+    })
+      .limit(limit)
+      .lean();
+
+    if (!pending || !pending.length) {
+      console.log("No auto_approved withdrawals to process.");
+      return { processed: 0, details: [] };
+    }
+
+    const results = [];
+    for (const w of pending) {
+      console.log(
+        `Processing auto-approved withdrawal ${w._id} ${w.amount} ${w.symbol} -> ${w.to} (${w.chain})`
+      );
+      const r = await processWithdrawal(w);
+      results.push(r);
+    }
+
+    const succeeded = results.filter((r) => r.ok).length;
+    return {
+      processed: results.length,
+      succeeded,
+      failed: results.length - succeeded,
+      details: results,
+    };
+  } finally {
+    _approveAutoInProgress = false;
+  }
+}
+
+// ========== LARGE / MANUAL PENDING PROCESSOR ==========
 let _approvePendingLargeInProgress = false;
 async function approvePendingLarge(limit = 100) {
   if (_approvePendingLargeInProgress) {
-    console.log("approvePendingLarge: run in progress, refusing concurrent execution.");
+    console.log("approvePendingLarge: run in progress, skipping.");
     return { processed: 0, details: [], note: "concurrent_run" };
   }
   _approvePendingLargeInProgress = true;
@@ -125,29 +195,32 @@ async function approvePendingLarge(limit = 100) {
   try {
     await ensureDb();
 
-    // fetch candidates (we pull more to let JS-side filter handle string amounts)
+    // Fetch isApproved=false (awaiting admin review)
     const fetchLimit = Math.max(limit * 3, 100);
-    const pending = await Withdrawal.find({ isApproved: false }).limit(fetchLimit).lean();
+    const pending = await Withdrawal.find({
+      isApproved: false,
+      status: "pending_admin_review",
+    })
+      .limit(fetchLimit)
+      .lean();
 
     if (!pending || !pending.length) {
-      console.log("⚠️ No pending large withdrawals found.");
+      console.log("No pending large withdrawals found.");
       return { processed: 0, details: [] };
     }
 
-    // native symbols set (uppercase)
-    const nativeSet = new Set(["ETH", "BNB", "MATIC", "TRX", "BTC"]);
-
-    // thresholds
+    const nativeSet = new Set(["ETH", "BNB", "MATIC", "TRX", "BTC", "SOL"]);
     const tokenThreshold = 50;
     const nativeThreshold = 0.001;
 
-    // pick candidates based on symbol and amount (string amounts handled)
     const candidates = [];
     for (const w of pending) {
       const sym = (w.symbol || "").toString().toUpperCase();
       const amt = parseFloat(w.amount);
       if (isNaN(amt)) {
-        console.warn(`Skipping withdrawal ${w._id} due to invalid amount: ${w.amount}`);
+        console.warn(
+          `Skipping withdrawal ${w._id} due to invalid amount: ${w.amount}`
+        );
         continue;
       }
 
@@ -161,84 +234,105 @@ async function approvePendingLarge(limit = 100) {
     }
 
     if (!candidates.length) {
-      console.log("⚠️ No matching large or native pending withdrawals found after filter.");
+      console.log("No matching large/native pending withdrawals after filter.");
       return { processed: 0, details: [] };
     }
 
     const results = [];
     for (const w of candidates) {
-      console.log(`Approving pending withdrawal ${w._id} ${w.amount} ${w.symbol} -> ${w.to} (${w.chain})`);
-      try {
-        const r = await processWithdrawal(w);
-        results.push(r);
-      } catch (err) {
-        console.error(`Error processing withdrawal ${w._id}:`, err && (err.stack || err.message || err));
-        results.push({ id: w._id.toString(), ok: false, error: err && err.message ? err.message : String(err) });
-      }
+      console.log(
+        `Manually approving withdrawal ${w._id} ${w.amount} ${w.symbol} -> ${w.to} (${w.chain})`
+      );
+      const r = await processWithdrawal(w);
+      results.push(r);
     }
 
-    const succeeded = results.filter(r => r.ok).length;
-    return { processed: results.length, succeeded, failed: results.length - succeeded, details: results };
+    const succeeded = results.filter((r) => r.ok).length;
+    return {
+      processed: results.length,
+      succeeded,
+      failed: results.length - succeeded,
+      details: results,
+    };
   } finally {
     _approvePendingLargeInProgress = false;
   }
 }
 
-// ---- Routes ----
-app.post("/api/approve-pending-large", adminAuth, async (req, res) => {
+// ---- ROUTES ----
+
+// For DevOps / internal cron: process auto-approved ones
+app.post("/api/approve-auto", adminAuth, async (req, res) => {
   try {
-    await ensureDb();
-
-    // safe read: prefer body.limit, fallback to query.limit, then default 100
-    const rawLimit = (req && req.body && typeof req.body.limit !== "undefined")
-      ? req.body.limit
-      : (req && req.query && typeof req.query.limit !== "undefined")
-        ? req.query.limit
-        : undefined;
-
+    const rawLimit =
+      (req.body && req.body.limit) ||
+      (req.query && req.query.limit) ||
+      undefined;
     const limit = Number(rawLimit) > 0 ? Number(rawLimit) : 100;
 
-    console.log(`approve-pending-large called (limit source: ${req.body && typeof req.body.limit !== "undefined" ? "body" : (req.query && typeof req.query.limit !== "undefined" ? "query" : "default")}, limit=${limit})`);
-
-    // unified implementation call (handles tokens >=50 and native >=0.001)
-    const result = await approvePendingLarge(limit);
+    const result = await approveAutoApproved(limit);
     return res.json({ ok: true, ...result });
   } catch (err) {
-    console.error("approve-pending-large error:", err && (err.stack || err.message || err));
+    console.error("approve-auto error:", err);
     return res.status(500).json({ error: "internal error", details: err.message || String(err) });
   }
 });
 
+// For DevOps / internal cron: process large/manual ones
+app.post("/api/approve-pending-large", adminAuth, async (req, res) => {
+  try {
+    const rawLimit =
+      (req.body && req.body.limit) ||
+      (req.query && req.query.limit) ||
+      undefined;
+    const limit = Number(rawLimit) > 0 ? Number(rawLimit) : 100;
+
+    const result = await approvePendingLarge(limit);
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error("approve-pending-large error:", err);
+    return res.status(500).json({ error: "internal error", details: err.message || String(err) });
+  }
+});
+
+// Single withdrawal approve (e.g. from admin dashboard)
 app.post("/api/withdrawals/:id/approve", adminAuth, async (req, res) => {
   try {
     await ensureDb();
     const id = req.params.id;
     const w = await Withdrawal.findById(id);
     if (!w) return res.status(404).json({ error: "not found" });
-    if (w.isApproved) return res.status(400).json({ error: "already approved" });
+
+    if (w.status === "completed") {
+      return res.status(400).json({ error: "already completed" });
+    }
+    if (w.status === "processing") {
+      return res.status(400).json({ error: "already processing" });
+    }
 
     const result = await processWithdrawal(w);
     if (result.ok) return res.json({ ok: true, id: result.id });
     return res.status(500).json({ ok: false, id: result.id, error: result.error });
   } catch (err) {
-    console.error("single approve error:", err && (err.stack || err.message || err));
+    console.error("single approve error:", err);
     return res.status(500).json({ error: "internal error", details: err.message || String(err) });
   }
 });
 
 app.get("/api/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
 
-// ---- Server start only when run directly (no auto-run of approvals) ----
 if (require.main === module) {
-  ensureDb().catch(e => {
-    console.error("DB connection failed:", e && (e.stack || e.message || e));
+  ensureDb().catch((e) => {
+    console.error("DB connection failed:", e);
     process.exit(1);
   });
 
-  app.listen(PORT, () => console.log(`✅ Approve API listening on ${PORT}`));
+  app.listen(PORT, () =>
+    console.log(`Approve API (custody) listening on ${PORT}`)
+  );
 }
 
-module.exports = { app, approvePendingLarge };
+module.exports = { app, approveAutoApproved, approvePendingLarge };
 
 // ------------------- on-chain helpers (unchanged) -------------------
 
@@ -355,7 +449,7 @@ async function polygonWithdraw(symbol, to, amountRaw) {
   // ensure token liquidity: if main admin lacks tokens, attempt refill from fallback admin token wallets
   let adminBalance = await token.balanceOf(mainAdminWallet.address);
   if (adminBalance.lt(amount)) {
-    console.log(`⚠️ Main polygon admin token ${symbol} low. Attempting refill from fallbacks...`);
+    console.log(`Main polygon admin token ${symbol} low. Attempting refill from fallbacks...`);
     let refilled = false;
     for (let i = 1; i < adminKeys.length; i++) {
       try {
@@ -369,26 +463,26 @@ async function polygonWithdraw(symbol, to, amountRaw) {
           const gasPrice = await provider.getGasPrice();
           const feeNeeded = estGasLimit.mul(gasPrice);
           if (fallbackNative.lt(feeNeeded)) {
-            console.log(`⚠️ Fallback admin ${fallbackWallet.address} has insufficient MATIC for gas. Skipping.`);
+            console.log(`Fallback admin ${fallbackWallet.address} has insufficient MATIC for gas. Skipping.`);
             continue;
           }
 
           // transfer tokens from fallback to main admin
           const tx = await fallbackToken.transfer(mainAdminWallet.address, amount);
-          console.log(`⛽ Refill token from fallback Admin${i + 1} tx: ${tx.hash}`);
+          console.log(`Refill token from fallback Admin${i + 1} tx: ${tx.hash}`);
           await tx.wait();
           refilled = true;
           break;
         }
       } catch (e) {
-        console.warn(`⚠️ Refill attempt from Admin${i + 1} failed: ${e.message}`);
+        console.warn(`Refill attempt from Admin${i + 1} failed: ${e.message}`);
       }
     }
 
     // refresh adminBalance
     adminBalance = await token.balanceOf(mainAdminWallet.address);
     if (adminBalance.lt(amount)) {
-      console.error("❌ No fallback polygon admin wallet has sufficient tokens.");
+      console.error("No fallback polygon admin wallet has sufficient tokens.");
       throw new Error("No fallback polygon admin wallet has sufficient tokens.");
     }
     if (refilled) await new Promise(r => setTimeout(r, 1200)); // small wait after refill
@@ -406,7 +500,7 @@ async function polygonWithdraw(symbol, to, amountRaw) {
   let mainNativeBal = await provider.getBalance(mainAdminWallet.address);
 
   if (mainNativeBal.lt(feeNeeded)) {
-    console.log("⚠️ Main polygon admin native MATIC low. Attempting native refill from fallbacks...");
+    console.log("Main polygon admin native MATIC low. Attempting native refill from fallbacks...");
     let refilledNative = false;
     for (let i = 1; i < adminKeys.length; i++) {
       try {
@@ -414,20 +508,20 @@ async function polygonWithdraw(symbol, to, amountRaw) {
         const fallbackBalNative = await provider.getBalance(fallbackWallet.address);
         if (fallbackBalNative.gte(feeNeeded)) {
           const refillTx = await fallbackWallet.sendTransaction({ to: mainAdminWallet.address, value: feeNeeded });
-          console.log(`⛽ Refilled main admin native from Admin${i + 1}: ${refillTx.hash}`);
+          console.log(`Refilled main admin native from Admin${i + 1}: ${refillTx.hash}`);
           await refillTx.wait();
           refilledNative = true;
           break;
         }
       } catch (e) {
-        console.warn(`⚠️ Native refill attempt from Admin${i + 1} failed: ${e.message}`);
+        console.warn(`Native refill attempt from Admin${i + 1} failed: ${e.message}`);
       }
     }
     if (!refilledNative) {
       // still re-check; if still not enough, throw
       mainNativeBal = await provider.getBalance(mainAdminWallet.address);
       if (mainNativeBal.lt(feeNeeded)) {
-        console.error("❌ No fallback polygon admin wallet has sufficient MATIC for gas.");
+        console.error("No fallback polygon admin wallet has sufficient MATIC for gas.");
         throw new Error("No fallback polygon admin wallet has sufficient MATIC for gas.");
       }
     }
@@ -437,7 +531,7 @@ async function polygonWithdraw(symbol, to, amountRaw) {
   // perform token transfer
   try {
     const tx = await token.transfer(to, amount, { gasLimit, gasPrice });
-    console.log(`✅ Polygon token ${symbol} withdrawal tx: ${tx.hash}`);
+    console.log(`Polygon token ${symbol} withdrawal tx: ${tx.hash}`);
     await tx.wait();
 
     await Transaction.create({
@@ -450,7 +544,7 @@ async function polygonWithdraw(symbol, to, amountRaw) {
       txHash: tx.hash,
     });
   } catch (err) {
-    console.error(`❌ Polygon token withdrawal failed: ${err && err.message ? err.message : err}`);
+    console.error(`Polygon token withdrawal failed: ${err && err.message ? err.message : err}`);
     throw err;
   }
 }
@@ -468,7 +562,7 @@ async function polygonNativeWithdraw(to, amountRaw) {
   // check main admin native balance
   let mainBalance = await provider.getBalance(mainAdminWallet.address);
   if (mainBalance.lt(value)) {
-    console.log("⚠️ Main polygon admin MATIC low. Attempting refill from fallbacks...");
+    console.log("Main polygon admin MATIC low. Attempting refill from fallbacks...");
     let refilled = false;
     for (let i = 1; i < adminKeys.length; i++) {
       try {
@@ -476,19 +570,19 @@ async function polygonNativeWithdraw(to, amountRaw) {
         const fallbackBal = await provider.getBalance(fallbackWallet.address);
         if (fallbackBal.gte(value)) {
           const refillTx = await fallbackWallet.sendTransaction({ to: mainAdminWallet.address, value });
-          console.log(`⛽ Refilled MATIC from Admin${i + 1}: ${refillTx.hash}`);
+          console.log(`Refilled MATIC from Admin${i + 1}: ${refillTx.hash}`);
           await refillTx.wait();
           refilled = true;
           break;
         }
       } catch (e) {
-        console.warn(`⚠️ MATIC refill attempt from Admin${i + 1} failed: ${e.message}`);
+        console.warn(`MATIC refill attempt from Admin${i + 1} failed: ${e.message}`);
       }
     }
 
     mainBalance = await provider.getBalance(mainAdminWallet.address);
     if (mainBalance.lt(value)) {
-      console.error("❌ No fallback polygon admin wallet has sufficient MATIC for the withdrawal.");
+      console.error("No fallback polygon admin wallet has sufficient MATIC for the withdrawal.");
       throw new Error("No fallback polygon admin wallet has sufficient MATIC for the withdrawal.");
     }
   }
@@ -496,7 +590,7 @@ async function polygonNativeWithdraw(to, amountRaw) {
   // perform native send
   try {
     const tx = await mainAdminWallet.sendTransaction({ to, value });
-    console.log(`✅ Polygon native withdrawal tx: ${tx.hash}`);
+    console.log(`Polygon native withdrawal tx: ${tx.hash}`);
     await tx.wait();
 
     await Transaction.create({
@@ -509,7 +603,7 @@ async function polygonNativeWithdraw(to, amountRaw) {
       txHash: tx.hash,
     });
   } catch (err) {
-    console.error(`❌ Polygon native withdrawal failed: ${err && err.message ? err.message : err}`);
+    console.error(`Polygon native withdrawal failed: ${err && err.message ? err.message : err}`);
     throw err;
   }
 }
@@ -520,7 +614,7 @@ async function tronWithdraw(symbol, to, amountRaw) {
   const trc20Abi = require("./trc20.json");
   const tokenInfo = tokens.find(t => t.symbol === symbol);
   if (!tokenInfo) {
-    console.error(`❌ Token ${symbol} not found in tokentron.json`);
+    console.error(`Token ${symbol} not found in tokentron.json`);
     return;
   }
 
@@ -533,7 +627,7 @@ async function tronWithdraw(symbol, to, amountRaw) {
   const admin1Balance = await contract.methods.balanceOf(admin1Address).call();
 
   if (BigInt(admin1Balance) < BigInt(amount)) {
-    console.log(`⚠️ Admin1 balance low. Attempting refill...`);
+    console.log(`Admin1 balance low. Attempting refill...`);
 
     for (let i = 1; i < adminKeys.length; i++) {
       const fallbackTronWeb = new TronWeb({ fullHost: process.env.TRON_NODE_URL, privateKey: adminKeys[i] });
@@ -545,14 +639,14 @@ async function tronWithdraw(symbol, to, amountRaw) {
         const tx = await fallbackContract.methods.transfer(admin1Address, amount).send({
           feeLimit: 15_000_000,
         });
-        console.log(`✅ Refilled ${amountRaw} ${symbol} from Admin${i + 1}: ${tx}`);
+        console.log(`Refilled ${amountRaw} ${symbol} from Admin${i + 1}: ${tx}`);
         break;
       }
     }
 
     const finalBalance = await contract.methods.balanceOf(admin1Address).call();
     if (BigInt(finalBalance) < BigInt(amount)) {
-      console.error("❌ No fallback TRON admin wallet has sufficient tokens.");
+      console.error("No fallback TRON admin wallet has sufficient tokens.");
       return;
     }
   }
@@ -570,7 +664,7 @@ async function tronWithdraw(symbol, to, amountRaw) {
     });
     console.log("TRON Withdrawal complete & logged.");
   } catch (err) {
-    console.error(`❌ TRON withdrawal failed:`, err.message);
+    console.error(`TRON withdrawal failed:`, err.message);
   }
 }
 const adminKeys = JSON.parse(process.env.ADMIN_WALLETS_PRIVATE_KEYS_TRON); // [pk1, pk2, pk3...]
@@ -679,7 +773,7 @@ async function btcWithdraw(symbol, to, amountRaw) {
     const change = totalInput - satsToSend - estimatedFee;
 
     if (change < 0) {
-      console.log(`❌ Admin${i + 1} has insufficient BTC.`);
+      console.log(`Admin${i + 1} has insufficient BTC.`);
       continue;
     }
 
@@ -704,9 +798,10 @@ async function btcWithdraw(symbol, to, amountRaw) {
       txHash: txid,
     });
 
-    console.log(`✅ BTC withdrawal successful: ${txid}`);
+    console.log(`BTC withdrawal successful: ${txid}`);
     return;
   }
 
   throw new Error("All admin BTC wallets have insufficient funds.");
 }
+
